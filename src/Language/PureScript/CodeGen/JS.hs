@@ -15,14 +15,14 @@ module Language.PureScript.CodeGen.JS
 import Prelude ()
 import Prelude.Compat
 
-import Data.List ((\\), delete, intersect)
+import Data.List ((\\), delete, intersect, intercalate)
 import Data.Maybe (isNothing, fromMaybe)
 import qualified Data.Map as M
 import qualified Data.Foldable as F
 import qualified Data.Traversable as T
 
 import Control.Arrow ((&&&))
-import Control.Monad (replicateM, forM, void)
+import Control.Monad (replicateM, forM, void, guard)
 import Control.Monad.Error.Class (MonadError(..))
 import Control.Monad.Reader (MonadReader, asks)
 import Control.Monad.Supply.Class
@@ -49,7 +49,7 @@ moduleToJs
   :: forall m
    . (Monad m, MonadReader Options m, MonadSupply m, MonadError MultipleErrors m)
   => Module Ann
-  -> Maybe JS
+  -> Maybe String
   -> m [JS]
 moduleToJs (Module coms mn imps exps foreigns decls) foreign_ =
   rethrow (addHint (ErrorInModule mn)) $ do
@@ -61,15 +61,14 @@ moduleToJs (Module coms mn imps exps foreigns decls) foreign_ =
     optimized <- T.traverse (T.traverse optimize) jsDecls
     F.traverse_ (F.traverse_ checkIntegers) optimized
     comments <- not <$> asks optionsNoComments
-    let strict = JSStringLiteral Nothing "use strict"
+    let strict = JSRaw Nothing ""
+    let foreignImport = foldMap (\mod -> [JSRaw Nothing $ "import * as $foreign from \"" ++ mod ++ "\""]) $ guard (not $ null foreigns) >> foreign_
     let header = if comments && not (null coms) then JSComment Nothing coms strict else strict
-    let foreign' = [JSVariableIntroduction Nothing "$foreign" foreign_ | not $ null foreigns || isNothing foreign_]
-    let moduleBody = header : foreign' ++ jsImports ++ concat optimized
-    let foreignExps = exps `intersect` (fst `map` foreigns)
-    let standardExps = exps \\ foreignExps
-    let exps' = JSObjectLiteral Nothing $ map (runIdent &&& (JSVar Nothing) . identToJs) standardExps
-                               ++ map (runIdent &&& foreignIdent) foreignExps
-    return $ moduleBody ++ [JSAssignment Nothing (JSAccessor Nothing "exports" (JSVar Nothing "module")) exps']
+    let moduleBody = header : foreignImport ++ jsImports ++ concat optimized
+    let foreignExps = map identToJs $ exps `intersect` (fst `map` foreigns)
+    let standardExps = map identToJs exps \\ foreignExps
+    let foreignExport = foldMap (\mod -> [JSRaw Nothing $ "export { " ++ intercalate ", " foreignExps ++ " } from \"" ++ mod ++ "\""]) $ guard (not $ null foreignExps) >> foreign_
+    return $ moduleBody ++ [JSRaw Nothing $ "export { " ++ intercalate ", " standardExps ++ " }"] ++ foreignExport
 
   where
 
@@ -111,8 +110,8 @@ moduleToJs (Module coms mn imps exps foreigns decls) foreign_ =
   importToJs mnLookup mn' = do
     path <- asks optionsRequirePath
     let ((ss, _, _, _), mnSafe) = fromMaybe (internalError "Missing value in mnLookup") $ M.lookup mn' mnLookup
-    let moduleBody = JSApp Nothing (JSVar Nothing "require") [JSStringLiteral Nothing (maybe id (</>) path $ runModuleName mn')]
-    withPos ss $ JSVariableIntroduction Nothing (moduleNameToJs mnSafe) (Just moduleBody)
+    let moduleBody = JSRaw Nothing $ "import * as " ++ (moduleNameToJs mnSafe) ++ " from " ++ "\"" ++ (maybe id (</>) path $ runModuleName mn') ++ "\""
+    withPos ss moduleBody
 
   -- |
   -- Replaces the `ModuleName`s in the AST so that the generated code refers to
@@ -314,7 +313,7 @@ moduleToJs (Module coms mn imps exps foreigns decls) foreign_ =
   --
   qualifiedToJS :: (a -> Ident) -> Qualified a -> JS
   qualifiedToJS f (Qualified (Just (ModuleName [ProperName mn'])) a) | mn' == C.prim = JSVar Nothing . runIdent $ f a
-  qualifiedToJS f (Qualified (Just mn') a) | mn /= mn' = accessor (f a) (JSVar Nothing (moduleNameToJs mn'))
+  qualifiedToJS f (Qualified (Just mn') a) | mn /= mn' = JSAccessor Nothing (identToJs $ f a) (JSVar Nothing (moduleNameToJs mn'))
   qualifiedToJS f (Qualified _ a) = JSVar Nothing $ identToJs (f a)
 
   foreignIdent :: Ident -> JS
